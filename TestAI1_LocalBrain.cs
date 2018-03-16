@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using System;
 using System.Linq;
 using ConvNetSharp.Core;
+using ConvNetSharp.Core.Layers;
 using ConvNetSharp.Core.Layers.Double;
 using ConvNetSharp.Core.Training;
 using ConvNetSharp.Volume;
@@ -16,6 +17,12 @@ public class TestAI1_LocalBrain : MonoBehaviour
     private Net<double> commonNet;
     private Net<double> piNet;
     private Net<double> vNet;
+    private Net<double> tNet;
+
+    private A3CAdamTrainer<double> c_trainer;
+    private A3CAdamTrainer<double> p_trainer;
+    private A3CAdamTrainer<double> v_trainer;
+    private A3CAdamTrainer<double> t_trainer;
 
     private void Start()
     {
@@ -29,16 +36,94 @@ public class TestAI1_LocalBrain : MonoBehaviour
         this.commonNet.AddLayer(new ReluLayer());
         this.commonNet.AddLayer(new PoolLayer(5, 5) { Stride = 5 });
         this.commonNet.AddLayer(new FullyConnLayer(50));
+        c_trainer = new A3CAdamTrainer<double>(commonNet)
+        {
+            LearningRate = 0.01,
+            BatchSize = 20,
+            L2Decay = 0.001,
+            Momentum = 0.9
+        };
 
         this.piNet = new Net<double>();
         this.piNet.AddLayer(new InputLayer(50,1,1));
         this.piNet.AddLayer(new FullyConnLayer(25));
         this.piNet.AddLayer(new FullyConnLayer(actionNum));
         this.piNet.AddLayer(new SoftmaxLayer(actionNum));
+        p_trainer = new A3CAdamTrainer<double>(commonNet)
+        {
+            LearningRate = 0.01,
+            BatchSize = 20,
+            L2Decay = 0.001,
+            Momentum = 0.9
+        };
 
+        this.vNet = new Net<double>();
         this.vNet.AddLayer(new InputLayer(50,1,1));
         this.piNet.AddLayer(new FullyConnLayer(25));
         this.piNet.AddLayer(new FullyConnLayer(1));
+        v_trainer = new A3CAdamTrainer<double>(commonNet)
+        {
+            LearningRate = 0.01,
+            BatchSize = 20,
+            L2Decay = 0.001,
+            Momentum = 0.9
+        };
+
+        this.tNet = new Net<double>();
+        this.tNet.AddLayer(new InputLayer(actionNum + 1, 1, 1));
+        this.tNet.AddLayer(new CalcTotalLossLayer(1));
+        t_trainer = new A3CAdamTrainer<double>(commonNet)
+        {
+            LearningRate = 0.01,
+            BatchSize = 20,
+            L2Decay = 0.001,
+            Momentum = 0.9
+        };
+    }
+
+    public void Train(Columun<double>[] clms)
+    {
+        //下降していく（inout1はsのreshape済み要素をbatch分並べる）
+        Volume<T> input1;
+
+        c_trainer.Forward(input1);//ここから、protectionLevel書き換えないとキツイ
+        FullyConnLayer c_LastLayer = commonNet.Layers[commonNet.Layers.Count - 1];
+        Volume<T> cOutA = c_LastLayer.OutputActivation;
+
+        p_trainer.Forward(cOutA);
+        FullyConnLayer p_LastLayer = piNet.Layers[piNet.Layers.Count - 1];
+        Volume<T> pOutA = p_LastLayer.OutputActivation;
+
+        v_trainer.Forward(cOutA);
+        FullyConnLayer v_LastLayer = vNet.Layers[vNet.Layers.Count - 1];
+        Volume<T> vOutA = v_LastLayer.OutputActivation;
+
+        //pvOutAはpとvの出力を単純に結合したものです
+        Volume<T> pvOutA;
+        t_trainer.Forward(pvOutA);
+
+        //逆伝播開始、Gradientを保存して、TrainImptemで一気に解決という流れ
+        //input2はlossと逆伝播誤差を計算するのに必要なVolume。CalcTotalLossLayer参照
+        Volume<T> input2;
+
+        t_trainer.Backward(input2);
+        CalcTotalLossLayer t_SecLayer = tNet.Layers[1];
+        Volume<T> tOutAG = t_SecLayer.OutputActivationGradients;
+        t_trainer.TrainImplem();
+
+        v_trainer.Backward(tOutAG);
+        FullyConnLayer v_SecLayer = vNet.Layers[1];
+        Volume<T> vOutAG = v_SecLayer.OutputActivationGradients;
+        v_trainer.TrainImplem();
+
+        p_trainer.Backward(tOutAG);
+        FullyConnLayer p_SecLayer = pNet.Layers[1];
+        Volume<T> pOutAG = p_SecLayer.OutputActivationGradients;
+        p_trainer.TrainImplem();
+
+        Volume<T> pvOutAG = Ops<T>.Add(vOutAG, pOutAG);
+        c_trainer.Backward(pvOutAG);
+        c_trainer.TrainImplem();
     }
 }
 
@@ -57,9 +142,17 @@ public class Columun<T> where T : struct, IEquatable<T>, IFormattable
         Reward = rew;
         State_ = st_;
     }
+
+    public Volume<T> AsVolume()
+    {
+        //Columunを1行の行列として取りだす()
+        Volume<T> vol = State;
+
+        return vol;
+    }
 }
 
-//A3C特有のTrainを定義するクラス(実装中)
+//A3C特有のTrainを定義するクラ:変えなくてよさそうです(AdamTrainer使えばよい)
 public class A3CAdamTrainer<T>: TrainerBase<T> where T : struct, IEquatable<T>, IFormattable
 {
     private readonly List<Volume<T>> gsum = new List<Volume<T>>(); // last iteration gradients (used for momentum calculations)
@@ -98,7 +191,7 @@ public class A3CAdamTrainer<T>: TrainerBase<T> where T : struct, IEquatable<T>, 
     {
         base.Backward(y);
 
-        this.L2DecayLoss = Ops<T>.Zero;
+        this.L2DecayLoss = Ops<T>.Zero;//new T と同じ
         this.L1DecayLoss = Ops<T>.Zero;
     }
 
@@ -167,39 +260,21 @@ public class A3CAdamTrainer<T>: TrainerBase<T> where T : struct, IEquatable<T>, 
 //入力がふたつある点でエラーの原因になるかも
 namespace ConvNetSharp.Core.Layers
 {
-    public class CalcTotalLossLayer<T> : LayerBase<T> where T : struct, IEquatable<T>, IFormattable
+    public class CalcTotalLossLayer<T> : LastLayerBase<T> where T : struct, IEquatable<T>, IFormattable
     {
-        /// <summary>
-        /// This computes the cross entropy loss and its gradient (not the softmax gradient)
-        /// </summary>
-        /// <param name="y"></param>
-        /// <param name="loss"></param>
-        public void Backward(Columun<T> y, out T loss)
+        public CalcTotalLossLayer(int cCount)
         {
-            // input gradient = pi - yi
-            y.DoSubtractFrom(this.OutputActivation, this.InputActivationGradients.ReShape(this.OutputActivation.Shape.Dimensions.ToArray()));
+            this.ClassCount = cCount;
+        }
 
-            //loss is the class negative log likelihood
+        public int ClassCount { get; set; }
+
+        public override void Backward(Volume<T> y, out T loss) //y入力は1行行列にしたColumunで
+        {
+            //OutputActivationGradientに誤差を入れる
+
+            //上部InputLayerの出力とyでlossを計算する。
             loss = Ops<T>.Zero;
-            for (var n = 0; n < y.Shape.GetDimension(3); n++)
-            {
-                for (var d = 0; d < y.Shape.GetDimension(2); d++)
-                {
-                    for (var h = 0; h < y.Shape.GetDimension(1); h++)
-                    {
-                        for (var w = 0; w < y.Shape.GetDimension(0); w++)
-                        {
-                            var expected = y.Get(w, h, d, n);
-                            var actual = this.OutputActivation.Get(w, h, d, n);
-                            if (Ops<T>.Zero.Equals(actual))
-                                actual = Ops<T>.Epsilon;
-                            var current = Ops<T>.Multiply(expected, Ops<T>.Log(actual));
-
-                            loss = Ops<T>.Add(loss, current);
-                        }
-                    }
-                }
-            }
 
             loss = Ops<T>.Negate(loss);
 
@@ -214,7 +289,7 @@ namespace ConvNetSharp.Core.Layers
 
         protected override Volume<T> Forward(Volume<T> input, bool isTraining = false)
         {
-            //結果でた上でのLayerなのでなにもやらんです
+            //InputActivationから計算出来るものは計算してしまう
             return this.OutputActivation;
         }
 
