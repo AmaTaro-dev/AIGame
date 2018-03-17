@@ -8,8 +8,9 @@ using ConvNetSharp.Core.Layers;
 using ConvNetSharp.Core.Layers.Double;
 using ConvNetSharp.Core.Training;
 using ConvNetSharp.Volume;
+using System.Diagnostics;
 
-public class TestAI1_LocalBrain : MonoBehaviour
+public class TestAI1_LocalBrain<T> : MonoBehaviour where T :struct, IEquatable<T>, IFormattable
 {
     [SerializeField]
     int actionNum = 6;
@@ -59,8 +60,8 @@ public class TestAI1_LocalBrain : MonoBehaviour
 
         this.vNet = new Net<double>();
         this.vNet.AddLayer(new InputLayer(50,1,1));
-        this.piNet.AddLayer(new FullyConnLayer(25));
-        this.piNet.AddLayer(new FullyConnLayer(1));
+        this.vNet.AddLayer(new FullyConnLayer(25));
+        this.vNet.AddLayer(new FullyConnLayer(1));
         v_trainer = new A3CAdamTrainer<double>(commonNet)
         {
             LearningRate = 0.01,
@@ -81,49 +82,162 @@ public class TestAI1_LocalBrain : MonoBehaviour
         };
     }
 
-    public void Train(Columun<double>[] clms)
+    public void Train(Columun<T>[] clms)
     {
         //下降していく（inout1はsのreshape済み要素をbatch分並べる）
-        Volume<T> input1;
-
-        c_trainer.Forward(input1);//ここから、protectionLevel書き換えないとキツイ
-        FullyConnLayer c_LastLayer = commonNet.Layers[commonNet.Layers.Count - 1];
-        Volume<T> cOutA = c_LastLayer.OutputActivation;
+        int reShapeSiz = (int)clms[0].State.Storage.Shape.TotalLength;
+        Volume<T> input1 = BuilderInstance<T>.Volume.SameAs(new Shape(new int[] { 0, reShapeSiz}));
+        for (int i = 0; i < clms.Length; i++)
+        {
+            input1 = Concatenate(new Volume<T>[] { input1, clms[i].State.ReShape(new Shape(new int[] { 1, reShapeSiz })) });
+        }
+        
+        c_trainer.Forward(VolFtTd(input1));//ここから、protectionLevel書き換えないとキツイ
+        var c_LastLayer = commonNet.Layers[commonNet.Layers.Count - 1];
+        Volume<double> cOutA = c_LastLayer.OutputActivation;
 
         p_trainer.Forward(cOutA);
-        FullyConnLayer p_LastLayer = piNet.Layers[piNet.Layers.Count - 1];
-        Volume<T> pOutA = p_LastLayer.OutputActivation;
+        var p_LastLayer = piNet.Layers[piNet.Layers.Count - 1];
+        Volume<T> pOutA = VolFdTt(p_LastLayer.OutputActivation);
 
         v_trainer.Forward(cOutA);
-        FullyConnLayer v_LastLayer = vNet.Layers[vNet.Layers.Count - 1];
-        Volume<T> vOutA = v_LastLayer.OutputActivation;
+        var v_LastLayer = vNet.Layers[vNet.Layers.Count - 1];
+        Volume<T> vOutA = VolFdTt(v_LastLayer.OutputActivation);
 
         //pvOutAはpとvの出力を単純に結合したものです
-        Volume<T> pvOutA;
-        t_trainer.Forward(pvOutA);
+        Volume<T> pvOutA = Concatenate(new Volume<T>[]{pOutA, vOutA});
+        tNet.Forward(VolFtTd(pvOutA));
 
         //逆伝播開始、Gradientを保存して、TrainImptemで一気に解決という流れ
         //input2はlossと逆伝播誤差を計算するのに必要なVolume。CalcTotalLossLayer参照
         Volume<T> input2;
 
         t_trainer.Backward(input2);
-        CalcTotalLossLayer t_SecLayer = tNet.Layers[1];
-        Volume<T> tOutAG = t_SecLayer.OutputActivationGradients;
+        var t_SecLayer = tNet.Layers[1];
+        Volume<double> tOutAG = t_SecLayer.OutputActivationGradients;
         t_trainer.TrainImplem();
 
-        v_trainer.Backward(tOutAG);
-        FullyConnLayer v_SecLayer = vNet.Layers[1];
-        Volume<T> vOutAG = v_SecLayer.OutputActivationGradients;
+        v_trainer.Backward(Split(tOutAG,actionNum)[0]);
+        var v_SecLayer = vNet.Layers[1];
+        Volume<double> vOutAG = v_SecLayer.OutputActivationGradients;
         v_trainer.TrainImplem();
 
-        p_trainer.Backward(tOutAG);
-        FullyConnLayer p_SecLayer = pNet.Layers[1];
-        Volume<T> pOutAG = p_SecLayer.OutputActivationGradients;
+        p_trainer.Backward(Split(tOutAG, actionNum)[1]);
+        var p_SecLayer = piNet.Layers[1];
+        Volume<double> pOutAG = p_SecLayer.OutputActivationGradients;
         p_trainer.TrainImplem();
 
-        Volume<T> pvOutAG = Ops<T>.Add(vOutAG, pOutAG);
+        Volume<double> pvOutAG = Ops<double>.Add(vOutAG, pOutAG);
         c_trainer.Backward(pvOutAG);
         c_trainer.TrainImplem();
+    }
+
+    private Volume<T> VolFdTt(Volume<double> inp)//１次元のみ
+    {
+        Volume<T> retVol = BuilderInstance<T>.Volume.SameAs(inp.Shape);
+        for (int i = 0; i < (int)inp.Shape.TotalLength; i++)
+        {
+            retVol.Set(i, (T)(object)inp.Get(i));
+        }
+        return retVol;
+    }
+
+    private Volume<double> VolFtTd(Volume<T> inp)
+    {
+        Volume<double> retVol = BuilderInstance<double>.Volume.SameAs(inp.Shape);
+        for (int i = 0; i < (int)inp.Shape.TotalLength; i++)
+        {
+            retVol.Set(i, (double)(object)inp.Get(i));
+        }
+        return retVol;
+    }
+
+    public static Volume<double>[] Split(Volume<double> inp, int place)//1次元、1箇所のみ
+    {
+        Volume<double>[] ret = new Volume<double>[2];
+        Volume<double> ret1 = BuilderInstance<double>.Volume.SameAs(new Shape(place));
+        for (int i = 0; i < place; i++)
+        {
+            ret1.Set(i, inp.Get(i));
+        }
+        Volume<double> ret2 = BuilderInstance<T>.Volume.SameAs(new Shape((int)inp.Shape.TotalLength - place));
+        for (int i = 0; i < (int)inp.Shape.TotalLength - place; i++)
+        {
+            ret2.Set(i, inp.Get(i + place));
+        }
+
+        ret[1] = ret1;
+        ret[2] = ret2;
+
+        return ret;
+    }
+
+    public static Volume<T> Concatenate(Volume<T>[] vols)//とりあえず1次元だけの実相
+    {
+        //くっつけるところ以外のdemensionが違えばエラー
+        int volsNum = vols.Length;
+        int dim = vols[0].Shape.DimensionCount;
+        for (int i = 1; i < volsNum; i++)
+        {
+            if (vols[i].Shape.DimensionCount != dim)
+                Debug.LogError("代入したものの次元が異なるよ");  
+        }
+        List<int> exDimNum = new List<int>(-1);
+        for (int i = 1; i < dim; i++)
+        {
+            exDimNum.Add(vols[0].Shape.Dimensions[i]);
+        }
+        for (int i = 1; i < volsNum; i++)
+        {
+            for (int j = 1; j < dim; j++)
+                if (exDimNum[j] != vols[i].Shape.Dimensions[j])
+                    Debug.LogError("代入したもののかたちがちがうぞ");
+        }
+        //それぞれのVolumeStorageを取得する
+        List<Shape> shapes = new List<Shape>();
+        List<VolumeStorage<T>> volStrs = new List<VolumeStorage<T>>();
+        int[] newShapeDims = new int[dim];
+        for (int i = 0; i < volsNum; i++)
+        {
+            shapes.Add(vols[i].Shape);
+            volStrs.Add(vols[i].Storage);
+            newShapeDims[0] += vols[i].Shape.Dimensions[0];
+        }
+        for (int i = 0; i < dim; i++)
+        {
+            newShapeDims[i] = exDimNum[i];
+        }
+
+        //VolumeStorageをSetしていく
+        Shape newShape = new Shape(newShapeDims);
+        Volume<T> retVol = BuilderInstance<T>.Volume.SameAs(newShape);
+        int startRowNum = 0;
+        if (dim == 1)
+        {
+            for (int i = 0; i < volsNum; i++)
+            {
+                for (int j = 0; j < shapes[i].Dimensions[0]; j++)
+                {
+                    retVol.Set(j + startRowNum, vols[i].Get(j));
+                }
+                startRowNum += shapes[i].Dimensions[0];
+            }
+        }
+        else if(dim == 2)
+        {
+            for (int i = 0; i < volsNum; i++)
+            {
+                for (int j = 0; j < shapes[i].Dimensions[0]; j++)
+                {
+                    for (int k = 0; k < exDimNum[1]; k++)
+                    {
+                        retVol.Set(j + startRowNum, k, vols[i].Get(j));
+                    }
+                }
+                startRowNum += shapes[i].Dimensions[0];
+            }
+        }
+        return retVol;
     }
 }
 
@@ -132,28 +246,84 @@ public class Columun<T> where T : struct, IEquatable<T>, IFormattable
 {
     public Volume<T> State { get; private set; }
     public Volume<T> Action { get; private set; }
-    public float Reward { get; private set; }
+    public Volume<T> Reward { get; private set; }//要素１の１次元vector
     public Volume<T> State_ { get; private set; }
 
-    public Columun(Volume<T> st, Volume<T> ac, float rew, Volume<T> st_)
+    public Columun(Volume<T> st, Volume<T> ac, T rew, Volume<T> st_)
     {
-        State = st;
-        Action = ac;
-        Reward = rew;
-        State_ = st_;
+        State = st.ReShape(new Shape((int)st.Shape.TotalLength));
+        Action = ac.ReShape(new Shape((int)ac.Shape.TotalLength));
+        Reward = BuilderInstance<T>.Volume.SameAs(new Shape(1));
+        Reward.Set(1, rew);
+        State_ = st_.ReShape(new Shape((int)st_.Shape.TotalLength));
     }
 
     public Volume<T> AsVolume()
     {
         //Columunを1行の行列として取りだす()
-        Volume<T> vol = State;
+        Volume<T> vol  = TestAI1_LocalBrain<T>.Concatenate(new Volume<T>[]{State, Action , Reward, State_});
 
         return vol;
     }
 }
 
+//TrainBaseの改変クラス
+namespace ConvNetSharp.Core.Training
+{
+    public abstract class TrainerBase_<T> where T : struct, IEquatable<T>, IFormattable
+    {
+        public INet<T> Net { get; }
+
+        protected TrainerBase_(INet<T> net)
+        {
+            this.Net = net;
+        }
+
+        public double BackwardTimeMs { get; protected set; }
+
+        public double ForwardTimeMs { get; protected set; }
+
+        public double UpdateWeightsTimeMs { get; private set; }
+
+        public virtual T Loss { get; protected set; }
+
+        public int BatchSize { get; set; } = 1;
+
+        public virtual void Backward(Volume<T> y)
+        {
+            var chrono = Stopwatch.StartNew();
+
+            var batchSize = y.Shape.GetDimension(3);
+            this.Loss = Ops<T>.Divide(this.Net.Backward(y), Ops<T>.Cast(batchSize));
+            this.BackwardTimeMs = chrono.Elapsed.TotalMilliseconds / batchSize;
+        }
+
+        public void Forward(Volume<T> x)
+        {
+            var chrono = Stopwatch.StartNew();
+            var batchSize = x.Shape.GetDimension(3);
+            this.Net.Forward(x, true); // also set the flag that lets the net know we're just training
+            this.ForwardTimeMs = chrono.Elapsed.TotalMilliseconds / batchSize;
+        }
+
+        public virtual void Train(Volume<T> x, Volume<T> y)
+        {
+            Forward(x);
+
+            Backward(y);
+
+            var batchSize = x.Shape.GetDimension(3);
+            var chrono = Stopwatch.StartNew();
+            TrainImplem();
+            this.UpdateWeightsTimeMs = chrono.Elapsed.TotalMilliseconds / batchSize;
+        }
+
+        public abstract void TrainImplem();
+    }
+}
+
 //A3C特有のTrainを定義するクラ:変えなくてよさそうです(AdamTrainer使えばよい)
-public class A3CAdamTrainer<T>: TrainerBase<T> where T : struct, IEquatable<T>, IFormattable
+public class A3CAdamTrainer<T>: TrainerBase_<T> where T : struct, IEquatable<T>, IFormattable
 {
     private readonly List<Volume<T>> gsum = new List<Volume<T>>(); // last iteration gradients (used for momentum calculations)
     private readonly List<Volume<T>> xsum = new List<Volume<T>>();
@@ -187,7 +357,7 @@ public class A3CAdamTrainer<T>: TrainerBase<T> where T : struct, IEquatable<T>, 
 
     public T Eps { get; set; }
 
-    protected override void Backward(Volume<T> y)
+    public override void Backward(Volume<T> y)
     {
         base.Backward(y);
 
@@ -195,7 +365,7 @@ public class A3CAdamTrainer<T>: TrainerBase<T> where T : struct, IEquatable<T>, 
         this.L1DecayLoss = Ops<T>.Zero;
     }
 
-    protected override void TrainImplem()
+    public override void TrainImplem()
     {
         var parametersAndGradients = this.Net.GetParametersAndGradients();
 
